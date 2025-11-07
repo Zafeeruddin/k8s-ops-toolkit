@@ -3,7 +3,6 @@
   hosts: master
   become: true
   gather_facts: true
-
   tasks:
     - name: Check cluster health
       command: kubectl get nodes
@@ -30,16 +29,114 @@
             {{ lookup('pipe', "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der | openssl dgst -sha256 -hex | sed 's/^.* //'") }}
       run_once: true
 
-
-
 - name: Prepare and join worker nodes
   hosts: workers
   become: true
   gather_facts: true
-
+  vars:
+    crio_version: "1.30"
   tasks:
+    - name: Ensure keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    # Clean up old CRI-O repositories
+    - name: Remove old repository files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/libcontainers.list
+        - /etc/apt/sources.list.d/cri-o.list
+        - /etc/apt/keyrings/libcontainers-archive-keyring.gpg
+        - /etc/apt/keyrings/cri-o-archive-keyring.gpg
+        - /etc/apt/keyrings/cri-o-apt-keyring.gpg
+
+    - name: Update apt cache after cleanup
+      apt:
+        update_cache: yes
+      ignore_errors: yes
+
+    # Install CRI-O from pkgs.k8s.io
+    - name: Download and add CRI-O GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/stable:/v{{ crio_version }}/deb/Release.key | \
+        gpg --dearmor | \
+        sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null
+      args:
+        creates: /etc/apt/keyrings/cri-o-apt-keyring.gpg
+
+    - name: Add CRI-O repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/cri-o.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v{{ crio_version }}/deb/ /
+        mode: '0644'
+
+    - name: Update apt cache for CRI-O repo
+      apt:
+        update_cache: yes
+
+    - name: Install conmon
+      apt:
+        name: conmon
+        state: present
+        update_cache: yes
+
+    - name: Install CRI-O
+      apt:
+        name: cri-o
+        state: present
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start CRI-O service
+      systemd:
+        name: crio
+        enabled: yes
+        state: started
+
+    - name: Verify CRI-O is running
+      command: systemctl is-active crio
+      register: crio_status
+      failed_when: crio_status.stdout != "active"
+      changed_when: false
+
+    # Install Kubernetes components
+    - name: Remove old Kubernetes GPG key if exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: absent
+
+    - name: Download and install Kubernetes GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg.new
+
+    - name: Set correct permissions on Kubernetes GPG keyring
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        mode: '0644'
+
+    - name: Add Kubernetes APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
     - name: Disable swap
       command: swapoff -a
+      changed_when: false
 
     - name: Ensure swap is off in fstab
       replace:
@@ -55,6 +152,14 @@
         - overlay
         - br_netfilter
 
+    - name: Ensure kernel modules load on boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
     - name: Apply sysctl params
       copy:
         dest: /etc/sysctl.d/k8s.conf
@@ -62,6 +167,7 @@
           net.bridge.bridge-nf-call-iptables = 1
           net.bridge.bridge-nf-call-ip6tables = 1
           net.ipv4.ip_forward = 1
+        mode: '0644'
       notify: Reload sysctl
 
     - name: Install Kubernetes tools
@@ -73,6 +179,81 @@
         state: present
         update_cache: yes
 
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    # Install crictl
+    - name: Download crictl
+      ansible.builtin.get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz"
+        dest: /tmp/crictl.tar.gz
+        mode: '0644'
+
+    - name: Extract crictl
+      ansible.builtin.unarchive:
+        src: /tmp/crictl.tar.gz
+        dest: /usr/local/bin/
+        remote_src: yes
+        creates: /usr/local/bin/crictl
+
+    - name: Set crictl permissions
+      ansible.builtin.file:
+        path: /usr/local/bin/crictl
+        mode: '0755'
+
+    - name: Configure crictl to use CRI-O
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///var/run/crio/crio.sock
+          image-endpoint: unix:///var/run/crio/crio.sock
+          timeout: 10
+        mode: '0644'
+
+    - name: Verify crictl installation
+      command: crictl --version
+      register: crictl_version
+      changed_when: false
+
+    - name: Display crictl version
+      debug:
+        msg: "crictl installed: {{ crictl_version.stdout }}"
+
+    # Set node IP
+    - name: Detect node IP address
+      shell: ip -4 addr show | grep -oP '(?<=inet\s)192\.168\.\d+\.\d+' | head -n 1
+      register: detected_ip
+      changed_when: false
+
+    - name: Set node IP fact
+      set_fact:
+        node_ip: "{{ detected_ip.stdout }}"
+
+    - name: Display detected node IP
+      debug:
+        msg: "Detected node IP: {{ node_ip }}"
+
+    # Configure kubelet
+    - name: Configure kubelet with node IP
+      copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+        mode: '0644'
+
+    - name: Restart kubelet to apply configuration
+      systemd:
+        name: kubelet
+        daemon_reload: yes
+        state: restarted
+      ignore_errors: yes
+
     - name: Reset any existing kubeadm state
       command: kubeadm reset --cri-socket unix:///var/run/crio/crio.sock --force
       ignore_errors: yes
@@ -80,10 +261,10 @@
     - name: Join worker to cluster
       command: >
         kubeadm join {{ hostvars[groups['master'][0]]['kube_join_info']['master_ip'] }}:6443
-        --token {{ hostvars[groups['master'][0]]['kube_join_info']['token'] }}
-        --discovery-token-ca-cert-hash sha256:{{ hostvars[groups['master'][0]]['kube_join_info']['ca_cert_hash'] }}
-        --cri-socket unix:///var/run/crio/crio.sock
-        --node-name {{ ansible_user }}
+          --token {{ hostvars[groups['master'][0]]['kube_join_info']['token'] }}
+          --discovery-token-ca-cert-hash sha256:{{ hostvars[groups['master'][0]]['kube_join_info']['ca_cert_hash'] }}
+          --cri-socket unix:///var/run/crio/crio.sock
+          --node-name "{{ ansible_user }}-{{ ansible_default_ipv4.address | regex_replace('\\.', '-') }}-{{ 9999 | random }}"
       args:
         creates: /etc/kubernetes/kubelet.conf
 
@@ -105,4 +286,4 @@
 
     - name: Display node list
       debug:
-        var: nodes_list.stdout
+        var: nodes_list.stdout_lines
