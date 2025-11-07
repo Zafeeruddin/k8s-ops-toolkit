@@ -1,0 +1,108 @@
+---
+- name: Generate kubeadm join info on master
+  hosts: master
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check cluster health
+      command: kubectl get nodes
+      register: cluster_health
+      failed_when: cluster_health.rc != 0
+      changed_when: false
+
+    - name: Generate kubeadm token
+      command: kubeadm token create
+      register: kube_token
+      changed_when: false
+
+    - name: Get token CA cert hash
+      command: kubeadm token list --output json
+      register: token_list
+      changed_when: false
+
+    - name: Set join facts for workers
+      set_fact:
+        kube_join_info:
+          token: "{{ kube_token.stdout }}"
+          master_ip: "{{ ansible_default_ipv4.address }}"
+          ca_cert_hash: >-
+            {{ lookup('pipe', "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der | openssl dgst -sha256 -hex | sed 's/^.* //'") }}
+      run_once: true
+
+
+
+- name: Prepare and join worker nodes
+  hosts: workers
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Ensure swap is off in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*(.*swap.*)$'
+        replace: '# \1'
+
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Apply sysctl params
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+      notify: Reload sysctl
+
+    - name: Install Kubernetes tools
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Reset any existing kubeadm state
+      command: kubeadm reset --cri-socket unix:///var/run/crio/crio.sock --force
+      ignore_errors: yes
+
+    - name: Join worker to cluster
+      command: >
+        kubeadm join {{ hostvars[groups['master'][0]]['kube_join_info']['master_ip'] }}:6443
+        --token {{ hostvars[groups['master'][0]]['kube_join_info']['token'] }}
+        --discovery-token-ca-cert-hash sha256:{{ hostvars[groups['master'][0]]['kube_join_info']['ca_cert_hash'] }}
+        --cri-socket unix:///var/run/crio/crio.sock
+        --node-name {{ ansible_user }}
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+
+- name: Verify cluster nodes
+  hosts: master
+  become: true
+  tasks:
+    - name: Wait for nodes to register
+      wait_for:
+        timeout: 10
+
+    - name: List all nodes
+      command: kubectl get nodes -o wide
+      register: nodes_list
+
+    - name: Display node list
+      debug:
+        var: nodes_list.stdout
