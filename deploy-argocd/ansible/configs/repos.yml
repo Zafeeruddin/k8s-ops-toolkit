@@ -1,0 +1,11 @@
+argocd_repositories:
+  - name: infra-repo
+    url: https://github.com/<username>/<repo-name>
+    username: "{{ github_username }}"
+    password: "{{ github_token }}"
+    project: default   
+  - name: manifest-repo
+    url: https://github.com/<username>/<repo-name>
+    username: "{{ github_username }}"
+    password: "{{ github_token }}"
+    project: default   

@@ -1,0 +1,6 @@
+argocd:
+  argocd_namespace: argocd
+  argocd_nodeport: 30080
+  argocd_port: 80
+  argocd_target_port: 8080
+  argocd_cli_path: /usr/local/bin/argocd

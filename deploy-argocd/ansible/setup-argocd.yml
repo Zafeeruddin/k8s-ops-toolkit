@@ -3,47 +3,64 @@
 - name: Setup argocd in Kubernetes
   hosts: k8s_master
   become: true
-  vars:
-    argocd_namespace: argocd
-    argocd_nodeport: 30080
-    argocd_port: 80
-    argocd_target_port: 8080
-    argocd_cli_path: /usr/local/bin/argocd
-    repo_url: https://github.com/masterworks-engineering/bb-infra
-    repo_username: ZafeerCodes
 
   vars_files:
-    - secrets.yml
+    - secret.yml
+    - configs/repos.yml
+    - configs/configs.yml
 
   tasks:
+
     - name: Ensure kubectl is installed
       command: kubectl version --client
       register: kubectl_check
       failed_when: kubectl_check.rc != 0
       changed_when: false
 
-
     - name: Create argocd namespace   
-      command: kubectl create namespace {{ argocd_namespace}}
+      command: kubectl create namespace {{ argocd.argocd_namespace}}
       register: create_ns
       failed_when: false
       changed_when: "'created' in create_ns.stdout"
 
-    - name: Apply ArgoCD installation manifest
-      command: kubectl apply -n {{ argocd_namespace }} -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+    - name: Apply ArgoCD installation manifest using kubectl
+      ansible.builtin.command: >
+        kubectl apply -n {{ argocd.argocd_namespace }} -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --validate=false
       register: applied_manifest
-      failed_when: false
-      changed_when: "'created' in applied_manifest.stdout or 'configured'  in applied_manifest.stdout"
+      changed_when: "'created' in applied_manifest.stdout or 'configured' in applied_manifest.stdout"
 
     - name: Patch argocd-server service to NodePort
       command: >
-        kubectl patch svc argocd-server -n {{ argocd_namespace }}
-        -p '{"spec": {"type": "NodePort", "ports": [{"port": {{ argocd_port }}, "targetPort": {{ argocd_target_port }}, "nodePort": {{ argocd_nodeport }}}]}}'
+        kubectl patch svc argocd-server -n {{ argocd.argocd_namespace }}
+        -p '{"spec": {"type": "NodePort", "ports": [{"port": {{ argocd.argocd_port }}, "targetPort": {{ argocd.argocd_target_port }}, "nodePort": {{ argocd.argocd_nodeport }}}]}}'
       register: patch_output
       changed_when: "'patched' in patch_output.stdout"
 
+    - name: Wait for ArgoCD server to be ready
+      ansible.builtin.command: >
+        kubectl wait --namespace {{ argocd.argocd_namespace }}
+        --for=condition=ready pod
+        -l app.kubernetes.io/name=argocd-server
+        --timeout=180s
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 5
+      delay: 15
+
+    - name: Check if ArgoCD UI is reachable
+      ansible.builtin.uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ argocd.argocd_nodeport }}"
+        method: GET
+        return_content: no
+        validate_certs: no
+      register: argocd_ui_check
+      retries: 10
+      delay: 5
+      until: argocd_ui_check.status == 200
+
+
     - name: Wait for ArgoCD admin secret to be created
-      command: kubectl -n {{ argocd_namespace }} get secret argocd-initial-admin-secret
+      command: kubectl -n {{ argocd.argocd_namespace }} get secret argocd-initial-admin-secret
       register: secret_check
       retries: 10
       delay: 10
@@ -51,7 +68,7 @@
       changed_when: false
 
     - name: Fetch ArgoCD admin password
-      command: kubectl -n {{ argocd_namespace }} get secret argocd-initial-admin-secret -o jsonpath="{.data.password}"
+      command: kubectl -n {{ argocd.argocd_namespace }} get secret argocd-initial-admin-secret -o jsonpath="{.data.password}"
       register: admin_secret
       changed_when: false
 
@@ -63,26 +80,36 @@
     - name: Display ArgoCD Admin Password
       ansible.builtin.debug:
         msg: "ArgoCD Admin Password: {{ argocd_admin_password }}"
+      no_log: true
+
+    - name: Download ArgoCD CLI
+      get_url:
+        url: https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        dest: /usr/local/bin/argocd
+        mode: '0755'
 
 
     - name: Login to ArgoCD CLI
       ansible.builtin.shell: |
-        argocd login {{ ansible_default_ipv4.address }}:{{ argocd_nodeport }} \
+        argocd login {{ ansible_default_ipv4.address }}:{{ argocd.argocd_nodeport }} \
         --username admin \
         --password {{ argocd_admin_password }} \
         --insecure
       register: argocd_login
       changed_when: "'logged in successfully' in argocd_login.stdout or 'already logged in' in argocd_login.stdout"
 
-    - name: Add Git repository to ArgoCD
+
+    - name: Add multiple Git repositories to ArgoCD
       ansible.builtin.shell: |
-        {{ argocd_cli_path }} repo add {{ repo_url }} \
-          --username {{ lookup('env', 'GITHUB_USER') }} \
-          --password {{ lookup('env', 'GITHUB_TOKEN') }}
+        {{ argocd.argocd_cli_path }} repo add {{ item.url }} \
+          --username {{ item.username }} \
+          --password {{ item.password }} \
+          --project {{ item.project }}
+      with_items: "{{ argocd_repositories }}"
       register: repo_add_output
       changed_when: "'Repository added' in repo_add_output.stdout or 'already exists' in repo_add_output.stdout"
 
     - name: Confirm ArgoCD setup complete
       ansible.builtin.debug:
-        msg: "ArgoCD setup completed successfully. Access via http://<node-ip>:{{ argocd_nodeport }}"
+        msg: "ArgoCD setup completed successfully. Access via http://{{ ansible_default_ipv4.address }}:{{ argocd.argocd_nodeport }}"
 
