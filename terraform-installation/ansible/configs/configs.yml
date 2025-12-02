@@ -1,0 +1,5 @@
+terraform:
+  version: "1.6.0"
+  install_path: "/usr/local/bin/terraform"
+  download_url: "https://releases.hashicorp.com/terraform/{{ terraform.version }}/terraform_{{ terraform.version }}_linux_amd64.zip"
+

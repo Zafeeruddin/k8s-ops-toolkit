@@ -1,0 +1,10 @@
+[project]
+name = "terraform-installation"
+version = "0.1.0"
+description = "Ansible playbook to install Terraform on target hosts"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ansible>=13.0.0",
+]
+
