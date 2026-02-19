@@ -54,7 +54,7 @@ Replace the IP addresses and usernames with your actual Kubernetes node informat
 Create an encrypted secrets file to store sensitive information:
 
 ```bash
-ansible-vault create asnible/secrets.yml
+ansible-vault create ansible/secrets.yml
 ```
 
 You'll be prompted to create a vault password. Remember this password as you'll need it to run the playbook.
