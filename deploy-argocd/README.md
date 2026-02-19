@@ -74,7 +74,7 @@ To generate a GitHub personal access token:
 
 ### Repo Configurations
 
-Edit configs/repos.yml file to store add all repos:
+Edit ansible/configs/repos.yml file to store add all repos:
 
 ```yaml
 - name: infra-repo
