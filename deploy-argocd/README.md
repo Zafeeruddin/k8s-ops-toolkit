@@ -63,7 +63,7 @@ You'll be prompted to create a vault password. Remember this password as you'll 
 
 ```yaml
 github_token: "your_github_personal_access_token"
-github_user: "your_github_username"
+github_username: "your_github_username"
 ```
 
 To generate a GitHub personal access token:
