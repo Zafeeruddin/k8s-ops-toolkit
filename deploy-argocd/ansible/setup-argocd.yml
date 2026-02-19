@@ -25,7 +25,7 @@
 
     - name: Apply ArgoCD installation manifest using kubectl
       ansible.builtin.command: >
-        kubectl apply -n {{ argocd.argocd_namespace }} -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --validate=false
+        kubectl apply -n argocd  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.11.3/manifests/install.yaml   --validate=false
       register: applied_manifest
       changed_when: "'created' in applied_manifest.stdout or 'configured' in applied_manifest.stdout"
 
